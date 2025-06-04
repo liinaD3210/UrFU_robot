@@ -1,0 +1,31 @@
+# .gitignore
+
+# Poetry virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / Editor specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+.env
+
+# Data files (если они большие или вы не хотите их версионировать)
+# Если данные нужны в репозитории, но не .env, закомментируйте следующую строку
+# data/
+
+# Streamlit cache/config (может появиться)
+.streamlit/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
