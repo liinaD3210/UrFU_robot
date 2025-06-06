@@ -1,283 +1,352 @@
-# app.py
 import streamlit as st
 import os
-import json
-from dotenv import load_dotenv
 import re
-from typing import List, Dict # Добавил Dict для типизации
+import docx2txt
+from typing import List, TypedDict
 
-# Langchain imports
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import RetrievalQA
-from langchain.schema import Document
-from langchain.prompts import PromptTemplate
-from langchain_core.retrievers import BaseRetriever # Изменено здесь
+from dotenv import load_dotenv
+from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langgraph.graph import StateGraph, END
+from langchain_core.pydantic_v1 import BaseModel, Field
 
-# Загрузка переменных окружения (API ключа)
+# --- 1. ЗАГРУЗКА И НАСТРОЙКА ---
+
+# Загружаем переменные окружения (GOOGLE_API_KEY)
 load_dotenv()
 
-if not os.getenv("GOOGLE_API_KEY"):
-    st.error("Не найден GOOGLE_API_KEY. Пожалуйста, добавьте его в файл .env")
-    st.stop()
-
-JSON_DATA_PATH = "data/programs_data.json" 
-
-@st.cache_resource
-def load_programs_data() -> tuple[List[dict], Dict[str, dict]]: # Добавил тип возвращаемого значения
-    if not os.path.exists(JSON_DATA_PATH):
-        st.error(f"Файл с данными программ не найден: {JSON_DATA_PATH}")
-        st.stop()
-    with open(JSON_DATA_PATH, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    programs_search_dict: Dict[str, dict] = {} # Явно типизируем
-    for program in data:
-        if "название_программы" in program and program["название_программы"]:
-            # Добавляем название программы и каждый профиль как отдельные ключи
-            base_name_lower = program["название_программы"].lower()
-            programs_search_dict[base_name_lower] = program
-            
-            # Если есть профиль, добавляем его тоже как ключ для поиска
-            # (возможно, объединенный с базовым названием)
-            if program.get("профиль_или_специализация"):
-                profile_name_lower = program["профиль_или_специализация"].lower()
-                programs_search_dict[profile_name_lower] = program # Поиск только по названию профиля
-                programs_search_dict[f"{base_name_lower} {profile_name_lower}"] = program # Поиск по "название + профиль"
-
-        if "id" in program and program["id"]: # Если есть код направления
-            programs_search_dict[program["id"]] = program
-        
-        # Дополнительно: можно разбить название на слова и добавить их как ключи,
-        # но это может привести к слишком многим совпадениям.
-        # words_in_name = re.findall(r'\b\w{3,}\b', program.get("название_программы", "").lower())
-        # for word in words_in_name:
-        #     if word not in programs_search_dict: # Чтобы не перезаписывать более точные совпадения
-        #         programs_search_dict[word] = program
+# Настройка страницы Streamlit
+st.set_page_config(page_title="Гид по ИРИТ-РТФ", page_icon="🤖", layout="wide")
+st.title("Агент-консультант для абитуриентов ИРИТ-РТФ")
+st.caption("Я отвечаю на вопросы только на основе загруженной базы знаний.")
 
 
-    st.info(f"Загружено {len(data)} программ из JSON. Создан поисковый словарь с {len(programs_search_dict)} ключами.")
-    return data, programs_search_dict
+# --- 2. ПАРСИНГ ДАННЫХ И СОЗДАНИЕ RETRIEVER ---
 
-class JsonProgramRetriever(BaseRetriever):
-    programs_list: List[dict]
-    programs_search_dict: dict # Словарь для быстрого поиска по ключам
-    k: int = 1 
-
-    def _get_relevant_documents(self, query: str, *, run_manager = None) -> List[Document]:
-        relevant_programs_data: List[dict] = []
-        query_lower = query.lower().strip()
-
-        # 0. Сначала ищем по ID, если он есть в запросе - это самый точный поиск
-        match_id = re.search(r'\b(\d{2}\.\d{2}\.\d{2}(?:-\w+)?)\b', query_lower) # Ищем код типа XX.YY.ZZ или XX.YY.ZZ-суффикс
-        if match_id:
-            program_id_from_query = match_id.group(1)
-            if program_id_from_query in self.programs_search_dict:
-                prog_data = self.programs_search_dict[program_id_from_query]
-                if prog_data not in relevant_programs_data:
-                    relevant_programs_data.append(prog_data)
-        
-        # 1. Попытка точного/частичного совпадения по ключам в search_dict
-        # (ключи: полные названия, ID, профили)
-        if len(relevant_programs_data) < self.k:
-            # Сортируем ключи словаря по длине в обратном порядке, чтобы сначала проверять более длинные (специфичные) ключи
-            sorted_search_keys = sorted(self.programs_search_dict.keys(), key=len, reverse=True)
-            for key_search in sorted_search_keys:
-                if key_search in query_lower: 
-                    program_data_val = self.programs_search_dict[key_search]
-                    if program_data_val not in relevant_programs_data: 
-                        relevant_programs_data.append(program_data_val)
-                    if len(relevant_programs_data) >= self.k*2: # Собираем чуть больше, потом отсортируем по релевантности
-                        break 
-        
-        # 2. Если совпадений по ключам мало, пробуем более гибкий поиск по отдельным словам в названии/профиле
-        if len(relevant_programs_data) < self.k:
-            query_words = set(re.findall(r'\b\w{3,}\b', query_lower)) # Слова от 3 букв
-            
-            candidate_programs = []
-            for program_data_val in self.programs_list:
-                if program_data_val in relevant_programs_data: continue
-
-                # Собираем текст для поиска: название + профиль + описание (первые N слов)
-                text_to_search_in = program_data_val.get("название_программы", "").lower()
-                if program_data_val.get("профиль_или_специализация"):
-                    text_to_search_in += " " + program_data_val["профиль_или_специализация"].lower()
-                
-                # Можно добавить начало описания для более широкого поиска
-                # description_preview = " ".join(program_data_val.get("описание", "").lower().split()[:20]) # первые 20 слов
-                # text_to_search_in += " " + description_preview
-
-                # Считаем количество совпавших слов
-                matched_words_count = len(query_words.intersection(set(re.findall(r'\b\w+\b', text_to_search_in))))
-
-                if matched_words_count > 0:
-                    candidate_programs.append({"program": program_data_val, "matches": matched_words_count})
-            
-            # Сортируем кандидатов по количеству совпавших слов
-            if candidate_programs:
-                sorted_candidates = sorted(candidate_programs, key=lambda x: x["matches"], reverse=True)
-                for cand in sorted_candidates:
-                    if cand["program"] not in relevant_programs_data:
-                        relevant_programs_data.append(cand["program"])
-                    if len(relevant_programs_data) >= self.k*2: # Собираем чуть больше
-                        break
-        
-        # Удаляем дубликаты, сохраняя порядок (сначала более релевантные)
-        final_relevant_programs = []
-        seen_ids = set()
-        for prog in relevant_programs_data:
-            prog_id_key = prog.get("id", str(prog)) # Уникальный ключ для программы
-            if prog_id_key not in seen_ids:
-                final_relevant_programs.append(prog)
-                seen_ids.add(prog_id_key)
-
-        if not final_relevant_programs:
-            st.warning(f"Отладка ретривера: Не удалось найти программу по запросу: '{query}'")
-            return [Document(page_content="Информация по вашему запросу о программе не найдена в базе данных.")]
-
-        # Форматируем найденные программы в документы
-        docs = []
-        st.info(f"Отладка ретривера: Найдено {len(final_relevant_programs)} программ-кандидатов для запроса '{query}'. Берем топ-{self.k}.")
-        for i, program_data_item in enumerate(final_relevant_programs[:self.k]): 
-            content_str = f"Информация по программе \"{program_data_item.get('название_программы', 'Неизвестно')}\":\n"
-            if program_data_item.get('профиль_или_специализация'):
-                content_str += f"- Профиль/Специализация: {program_data_item['профиль_или_специализация']}\n"
-            
-            # Отображаем поля в определенном порядке для лучшей читаемости
-            display_order = ["id", "срок_обучения_лет", "обязательные_предметы", 
-                             "предметы_по_выбору_примечание", "предметы_по_выбору_детали",
-                             "проходной_балл_2024", "бюджетные_места", "описание"]
-            
-            processed_keys = set(["название_программы", "профиль_или_специализация"])
-
-            for key_item in display_order:
-                if key_item in program_data_item and program_data_item[key_item] is not None:
-                    value_item = program_data_item[key_item]
-                    formatted_key = key_item.replace('_', ' ').capitalize()
-                    
-                    if key_item == "описание" and isinstance(value_item, str) and len(value_item) > 300: # Сокращаем длинное описание
-                         content_str += f"- {formatted_key}: {value_item[:300]}...\n"
-                    elif isinstance(value_item, list) and value_item: # Для списков (например, предметы)
-                        content_str += f"- {formatted_key}:\n"
-                        for item_list_el in value_item:
-                            if isinstance(item_list_el, dict): # Если элемент списка - словарь
-                                item_str_dict = ", ".join([f"{ik_dict.replace('_', ' ').capitalize() if ik_dict != 'название' else ''}{': ' if ik_dict != 'название' else ''}{iv_dict}" for ik_dict, iv_dict in item_list_el.items()])
-                                content_str += f"  - {item_str_dict}\n"
-                            else: # Если элемент списка - простое значение
-                                content_str += f"  - {item_list_el}\n"
-                    else: # Для обычных значений
-                        content_str += f"- {formatted_key}: {value_item}\n"
-                    processed_keys.add(key_item)
-
-            # Добавляем остальные поля, если они есть и не были обработаны
-            for key_item, value_item in program_data_item.items():
-                if key_item not in processed_keys and value_item is not None:
-                    formatted_key = key_item.replace('_', ' ').capitalize()
-                    content_str += f"- {formatted_key}: {value_item}\n"
-
-            docs.append(Document(page_content=content_str, metadata={"source": "json_database", "program_name": program_data_item.get("название_программы")}))
-            if i == 0: # Печатаем только первый найденный документ для отладки
-                 st.info(f"Отладка ретривера: Первый найденный документ для LLM:\n{content_str[:500]}...")
-        
-        return docs
-
-    async def _aget_relevant_documents(self, query: str, *, run_manager = None) -> List[Document]:
-        # Для простоты, используем синхронную версию. Для продакшена лучше реализовать асинхронно.
-        return self._get_relevant_documents(query, run_manager=run_manager)
-
-
-@st.cache_resource
-def setup_llm_and_retriever():
-    programs_list, programs_search_dict = load_programs_data()
-    
-    custom_retriever = JsonProgramRetriever(
-        programs_list=programs_list,
-        programs_search_dict=programs_search_dict,
-        k=1 
-    )
-
-    try:
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            temperature=0.2, # Еще ниже для строгих ответов по JSON
-            convert_system_message_to_human=True
-        )
-    except Exception as e:
-        st.error(f"Ошибка при инициализации LLM Google: {e}")
+@st.cache_resource(show_spinner="Загружаю и индексирую базу знаний...")
+def load_and_index_data(file_path: str):
+    """
+    Загружает DOCX файл, парсит его на отдельные направления подготовки
+    и создает векторный retriever (поисковик).
+    """
+    if not os.path.exists(file_path):
+        st.error(f"Файл не найден по пути: {file_path}")
         st.stop()
 
-    prompt_template_str = """Ты — ИИ-ассистент, отвечающий на вопросы об образовательных программах ИРИТ-РТФ.
-Используй ТОЛЬКО предоставленную информацию о программе (контекст), чтобы ответить на вопрос.
-Если в контексте нет ответа на вопрос, скажи: "В предоставленной информации о программе нет ответа на этот вопрос." или "Я не нашел эту информацию в описании программы."
-Не придумывай информацию. Отвечай на русском языке.
+    text = docx2txt.process(file_path)
+    # Используем regex для разделения текста на блоки по коду направления (e.g., 09.03.01)
+    # re.S (dotall) позволяет '.' совпадать с переносом строки
+    chunks = re.findall(r'(\d{2}\.\d{2}\.\d{2}.*?)(?=\d{2}\.\d{2}\.\d{2}|\Z)', text, re.S)
 
-Контекст (информация о программе):
+    documents = []
+    for chunk in chunks:
+        # Извлекаем название направления (первая строка) для метаданных
+        title = chunk.split('\n', 1)[0].strip()
+        doc = Document(page_content=chunk, metadata={"source": title})
+        documents.append(doc)
+
+    if not documents:
+        st.error("Не удалось распарсить документ на направления. Проверьте формат файла.")
+        st.stop()
+
+    # Создаем эмбеддинги с помощью модели Google
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+    # Создаем векторную базу FAISS для быстрого поиска
+    vectorstore = FAISS.from_documents(documents, embeddings)
+
+    # Создаем retriever, который будет возвращать до 3 самых похожих документов
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    return retriever, documents
+
+# Запускаем загрузку данных. Результат кэшируется.
+retriever, all_documents = load_and_index_data("data/irit_rtf_baccalaureate_info.docx")
+
+
+
+# --- 3. ОПРЕДЕЛЕНИЕ ГРАФА ДИАЛОГА (LANGGRAPH) ---
+
+class GraphState(TypedDict):
+    """Определяет состояние нашего графа"""
+    original_question: str # Новый ключ для хранения исходного вопроса
+    question: str          # Текущий рабочий вопрос
+    documents: List[Document] # Найденные документы
+    generation: str        # Сгенерированный LLM ответ
+    clarification_needed: bool # Флаг, нужно ли уточнение
+
+# Инициализируем LLM
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, convert_system_message_to_human=True)
+
+# --- Узлы графа ---
+
+# --- Узлы графа ---
+
+def retrieve_docs(state: GraphState) -> GraphState:
+    """
+    Узел для поиска релевантных документов.
+    ЭТОТ УЗЕЛ МОДИФИЦИРОВАН для решения проблемы бесконечного уточнения.
+    """
+    print("--- УЗЕЛ: ПОИСК ДОКУМЕНТОВ (с логикой уточнения) ---")
+    question = state["question"]
+    
+    # --- НАЧАЛО НОВОЙ ЛОГИКИ ---
+    # Сначала проверяем, не является ли вопрос точным выбором из предложенных вариантов.
+    # Мы ищем точное совпадение названия направления (из метаданных) в тексте вопроса.
+    # Это срабатывает, когда пользователь нажимает на кнопку с названием.
+    for doc in all_documents:
+        # doc.metadata['source'] содержит полное название, например "11.03.01 Радиотехника"
+        doc_title = doc.metadata.get("source", "")
+        if doc_title and doc_title.lower() in question.lower():
+            print(f"--- НАЙДЕНО ТОЧНОЕ СОВПАДЕНИЕ ПО НАЗВАНИЮ: {doc_title} ---")
+            # Если нашли, то не используем векторный поиск, а сразу возвращаем этот один документ.
+            # Это и есть ключ к разрыву цикла уточнений.
+            documents = [doc]
+            # Используем правильный порядок обновления стейта
+            return {
+                "documents": documents,
+                "question": question,
+                "generation": "",
+                "clarification_needed": False
+            }
+    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+    # Если точного совпадения не найдено, это первичный запрос.
+    # Выполняем обычный векторный поиск.
+    print("--- Точного совпадения нет, выполняю векторный поиск по всему тексту ---")
+    documents = retriever.invoke(question)
+    return {
+        "documents": documents,
+        "question": question,
+        "original_question": question,
+        "generation": "",
+        "clarification_needed": False
+    }
+
+from langchain_core.pydantic_v1 import BaseModel, Field
+
+# Структура для оценки релевантности
+class RelevanceGrade(BaseModel):
+    """Бинарная оценка релевантности документа вопросу."""
+    score: str = Field(description="Отвечает ли документ на вопрос, 'yes' или 'no'.")
+
+# LLM с настроенным выводом для оценки
+structured_llm_grader = llm.with_structured_output(RelevanceGrade)
+
+# Промпт для грейдера
+grader_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "Ты — эксперт по оценке релевантности. Твоя задача - проверить, содержит ли предоставленный документ ответ на вопрос пользователя. Отвечай только 'yes' или 'no'."),
+        ("human", "Документ:\n\n{document}\n\nВопрос: {question}"),
+    ]
+)
+
+relevance_grader = grader_prompt | structured_llm_grader
+
+def grade_documents(state: GraphState) -> GraphState:
+    """
+    Узел для оценки найденных документов.
+    - Отбрасывает нерелевантные.
+    - Решает, нужно ли уточнение, если релевантных > 1.
+    """
+    print("--- УЗЕЛ: УМНАЯ ОЦЕНКА ДОКУМЕНТОВ ---")
+    question = state["question"]
+    documents = state["documents"]
+    
+    if not documents:
+        return {**state, "documents": []}
+
+    # Оцениваем каждый документ
+    filtered_docs = []
+    for d in documents:
+        grade = relevance_grader.invoke({"question": question, "document": d.page_content})
+        if grade.score.lower() == "yes":
+            print(f"--- ДОКУМЕНТ '{d.metadata.get('source', '')}' РЕЛЕВАНТЕН ---")
+            filtered_docs.append(d)
+        else:
+            print(f"--- ДОКУМЕНТ '{d.metadata.get('source', '')}' НЕРЕЛЕВАНТЕН ---")
+    
+    # Решаем, нужно ли уточнение
+    # Если на вопрос "где есть физика?" нашлось 3 релевантных документа,
+    # то уточнять НЕ нужно, нужно делать сводный ответ.
+    # Уточнение нужно, если вопрос был нечеткий, например "расскажи про IT".
+    # Для простоты, пока будем считать, что если нашлось несколько релевантных, то делаем сводку.
+    clarification_needed = False # По умолчанию, делаем сводный ответ
+    if len(filtered_docs) > 1:
+        # Здесь можно добавить более сложную логику, например,
+        # еще один вызов LLM, чтобы спросить "нужно ли уточнение для этого вопроса?"
+        # Но для начала, упростим: если вопрос про конкретные атрибуты (физика, баллы),
+        # то уточнение не нужно. Если общий - нужно.
+        # Для нашего кейса "куда с физикой" - clarification_needed = False
+        print("--- Найдено несколько релевантных документов, будет сгенерирован сводный ответ. ---")
+
+    return {**state, "documents": filtered_docs, "clarification_needed": clarification_needed}
+
+
+def generate_answer(state: GraphState) -> GraphState:
+    """Узел для генерации ответа с помощью LLM, ИСПОЛЬЗУЕТ ORIGINAL_QUESTION."""
+    print("--- УЗЕЛ: ГЕНЕРАЦИЯ ОТВЕТА ---")
+    # Используем ИСХОДНЫЙ вопрос для сохранения контекста!
+    question = state["original_question"]
+    documents = state["documents"]
+
+    prompt_template = ChatPromptTemplate.from_template(
+        """Ты — чат-бот-помощник абитуриента ИРИТ-РТФ.
+Твоя задача — отвечать на вопросы, основываясь ИСКЛЮЧИТЕЛЬНО на предоставленном ниже контексте.
+Синтезируй информацию из всех предоставленных фрагментов, чтобы дать полный и исчерпывающий ответ на исходный вопрос пользователя.
+Если контекст позволяет, сначала дай краткий сводный ответ (например, перечисли направления), а затем опиши детали.
+
+КОНТЕКСТ:
 {context}
 
-Вопрос: {question}
-Ответ на русском языке на основе контекста:"""
-    PROMPT = PromptTemplate(
-        template=prompt_template_str, input_variables=["context", "question"]
+ИСХОДНЫЙ ВОПРОС:
+{question}
+"""
     )
+    
+    rag_chain = prompt_template | llm | StrOutputParser()
+    context_str = "\n\n---\n\n".join([doc.page_content for doc in documents])
+    generation = rag_chain.invoke({"context": context_str, "question": question})
+    
+    return {**state, "generation": generation}
 
-    chain_type_kwargs = {"prompt": PROMPT}
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=custom_retriever, 
-        return_source_documents=True,
-        chain_type_kwargs=chain_type_kwargs
-    )
-    return qa_chain
+def generate_clarification(state: GraphState) -> GraphState:
+    """
+    Узел для формирования уточняющего вопроса.
+    ВОЗВРАЩАЕТ ТОЛЬКО МАШИНОЧИТАЕМЫЙ МАРКЕР И СПИСОК.
+    """
+    print("--- УЗЕЛ: ФОРМИРОВАНИЕ УТОЧНЕНИЯ ---")
+    documents = state["documents"]
+    doc_titles = [doc.metadata.get("source", "Неизвестное направление") for doc in documents]
+    
+    # НОВЫЙ ФОРМАТ: только маркер и опции, разделенные переносом строки.
+    # Интерфейс сам добавит вводный текст.
+    clarification_message = "CLARIFY_OPTIONS:\n" + "\n".join(doc_titles)
+    
+    return {**state, "generation": clarification_message}
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="ИРИТ-РТФ Гид (JSON)", layout="centered")
-st.title("🤖 Гид по ИРИТ-РТФ (на основе JSON)")
 
-try:
-    qa_chain = setup_llm_and_retriever()
-except Exception as e:
-    st.error(f"Критическая ошибка при настройке приложения: {e}")
-    st.stop() 
+def fallback(state: GraphState) -> GraphState:
+    """Узел для ответа, если ничего не найдено."""
+    print("--- УЗЕЛ: ОТВЕТ-ЗАГЛУШКА ---")
+    generation = "К сожалению, я не нашел информации по вашему запросу в своей базе знаний. Попробуйте переформулировать вопрос."
+    # ПРАВИЛЬНЫЙ ПОРЯДОК: сначала старый стейт, потом новое значение
+    return {**state, "generation": generation}
 
+
+# --- Условные переходы графа ---
+
+def decide_next_step(state: GraphState) -> str:
+    """Определяет следующий шаг на основе оценки документов."""
+    print("--- УСЛОВИЕ: ПРИНЯТИЕ РЕШЕНИЯ ---")
+    if not state["documents"]:
+        print("--- РЕШЕНИЕ: Ничего не найдено -> fallback ---")
+        return "fallback"
+    if state["clarification_needed"]:
+        print("--- РЕШЕНИЕ: Нужно уточнение -> clarify ---")
+        return "clarify"
+    else:
+        print("--- РЕШЕНИЕ: Всё ясно -> generate ---")
+        return "generate"
+
+
+# --- Сборка графа ---
+workflow = StateGraph(GraphState)
+
+workflow.add_node("retrieve", retrieve_docs)
+workflow.add_node("grade_documents", grade_documents)
+workflow.add_node("generate", generate_answer)
+workflow.add_node("clarify", generate_clarification)
+workflow.add_node("fallback", fallback)
+
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "grade_documents")
+workflow.add_conditional_edges(
+    "grade_documents",
+    decide_next_step,
+    {
+        "clarify": "clarify",
+        "generate": "generate",
+        "fallback": "fallback",
+    },
+)
+workflow.add_edge("generate", END)
+workflow.add_edge("clarify", END)
+workflow.add_edge("fallback", END)
+
+# Компилируем граф в исполняемый объект
+app = workflow.compile()
+
+
+# --- 4. ИНТЕРФЕЙС STREAMLIT (ФИНАЛЬНАЯ ВЕРСИЯ С ДЕАКТИВАЦИЕЙ КНОПОК) ---
+
+# Инициализация истории чата
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Здравствуйте! Задайте вопрос о направлении подготовки ИРИТ-РТФ."}]
+    st.session_state.messages = [{"role": "assistant", "content": "Здравствуйте! Чем я могу вам помочь с выбором направления в ИРИТ-РТФ?"}]
 
+# Коллбэк для кнопок уточнения. Он только сохраняет выбор.
+def handle_clarification_click(option_text):
+    st.session_state.clarification_choice = option_text
+
+# 1. БЛОК ОТРИСОВКИ: всегда рисуем из истории
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        content = message["content"]
+        # Проверяем, есть ли в сообщении ассистента маркер для кнопок
+        if isinstance(content, str) and content.startswith("CLARIFY_OPTIONS:"):
+            st.markdown("Я нашел несколько подходящих направлений. Пожалуйста, уточните, какое из них вас интересует:")
+            options = content.split('\n')[1:]
+            num_columns = min(len(options), 3)
+            cols = st.columns(num_columns)
+            for i, option in enumerate(options):
+                if option.strip():
+                    with cols[i % num_columns]:
+                        st.button(
+                            option,
+                            on_click=handle_clarification_click,
+                            args=[option],
+                            use_container_width=True,
+                            # Ключ теперь может быть и не уникальным в истории, т.к. мы убираем старые кнопки
+                            key=f"clarify_btn_{option.replace(' ', '_')}_{i}" 
+                        )
+        else:
+            # Если это обычное сообщение, просто рисуем его
+            st.markdown(content)
 
-if prompt := st.chat_input("Ваш вопрос (например, 'Расскажи про Радиотехнику' или 'Какие предметы на 09.03.01?')..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# 2. БЛОК ОБРАБОТКИ ВВОДА
 
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-        with st.spinner("Ищу информацию и думаю..."):
-            try:
-                result = qa_chain({"query": prompt})
-                answer = result.get("result", "Не удалось получить ответ.")
-                source_documents = result.get("source_documents")
-                
-                full_response = answer
-                
-                if source_documents and not (len(source_documents) == 1 and "Информация по вашему запросу о программе не найдена в базе данных." in source_documents[0].page_content):
-                    full_response += "\n\n<details><summary>Источник информации (данные по программе):</summary>\n"
-                    for doc in source_documents:
-                        content_html = doc.page_content.replace('\n', '<br>') 
-                        full_response += f"<p><small><i>{content_html}</i></small></p>\n"
-                    full_response += "</details>"
-
-            except Exception as e:
-                st.error(f"Ошибка при обработке запроса: {e}")
-                full_response = f"Произошла ошибка: {e}"
-        
-        message_placeholder.markdown(full_response, unsafe_allow_html=True)
+# Сначала проверяем, не был ли сделан выбор кнопкой (это имеет приоритет)
+if prompt_from_button := st.session_state.get("clarification_choice"):
+    # Сбрасываем триггер
+    st.session_state.clarification_choice = None
     
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: ДЕАКТИВАЦИЯ СТАРЫХ КНОПОК ---
+    # Находим последнее сообщение с кнопками и заменяем его на текст выбора
+    for i in range(len(st.session_state.messages) - 1, -1, -1):
+        msg = st.session_state.messages[i]
+        if msg["role"] == "assistant" and msg["content"].startswith("CLARIFY_OPTIONS:"):
+            msg["content"] = f"Вы уточнили свой выбор: **{prompt_from_button}**"
+            break
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
+    # Добавляем "виртуальный" ввод пользователя в историю
+    st.session_state.messages.append({"role": "user", "content": f"Расскажи подробнее про \"{prompt_from_button}\""})
+    # Принудительно перезапускаем скрипт, чтобы запустить обработку
+    st.rerun()
 
-if len(st.session_state.messages) > 1 :
-    if st.button("🗑️ Очистить чат"):
-        st.session_state.messages = [{"role": "assistant", "content": "Здравствуйте! Задайте вопрос о направлении подготовки ИРИТ-РТФ."}]
-        st.rerun()
+# Если не было нажатия на кнопку, проверяем ручной ввод
+if user_input := st.chat_input("Задайте ваш вопрос...", key="main_chat_input"):
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.rerun()
+
+# 3. БЛОК ГЕНЕРАЦИИ ОТВЕТА (остается без изменений)
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    user_question = st.session_state.messages[-1]["content"]
+    with st.chat_message("assistant"):
+        with st.spinner("Думаю..."):
+            final_state = app.invoke({"question": user_question})
+            response = final_state['generation']
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.rerun()
