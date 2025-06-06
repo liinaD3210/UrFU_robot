@@ -1,0 +1,11 @@
+streamlit
+python-dotenv
+google-generativeai
+langchain-google-genai
+langchain
+langchain-core
+langchain-community
+langgraph
+docx2txt  # Для чтения .docx файлов
+faiss-cpu # Векторная база данных
+tiktoken
